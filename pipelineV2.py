@@ -80,13 +80,6 @@ def scores_to_distribution(scores, n_classes=6):
 
 LABELS = np.arange(6)  # 0..5
 
-def dirac_head(s):
-    """Round a scalar s in [0,1] to an integer 0..5 and return a one-hot distribution."""
-    probs = np.zeros(6)
-    idx = int(np.clip(round(s * (LABELS.shape[0] - 1)), 0, 5))
-    probs[idx] = 1.0
-    return probs
-
 def trunc_normal_head(s, sigma):
     """Gaussian-like smoothing around s (mapped to [0..5])."""
     s_scaled = s * (LABELS.shape[0] - 1)
@@ -295,7 +288,7 @@ def run_baseline_experiment(pretrained_ce, train, val, test, distance_matrix):
        outputs scalar similarity in [0..5].
     2) Predicts a scalar for train/val/test.
     3) Tunes the TruncNormal head per (mode, tercile) on the validation split.
-    4) Evaluates JSD and EMD on the test split using Dirac and TruncNormal heads.
+    4) Evaluates JSD and EMD on the test split using the TruncNormal head.
     """
 
     logging.info("Running BASELINE experiment with CrossEncoder('cross-encoder/stsb-roberta-large')")
@@ -340,13 +333,6 @@ def run_baseline_experiment(pretrained_ce, train, val, test, distance_matrix):
     emd_with = EMD(distance_matrix=distance_matrix, convert_logits=False)
 
     global_scores = {}
-
-    test_pred_dirac = np.stack(test["pred_scalar"].apply(dirac_head))
-    global_scores["Dirac"] = {
-        "jsd": jsd_calc((test_pred_dirac, test_true), support_size=6)["jsd"],
-        "emd_no": emd_no((test_pred_dirac, test_true), support_size=6)["emd"],
-        "emd_with": emd_with((test_pred_dirac, test_true), support_size=6)["emd"],
-    }
         
     # Handle TruncNormal with strata-based sigma
     test_pred_tn = test.apply(
@@ -362,22 +348,9 @@ def run_baseline_experiment(pretrained_ce, train, val, test, distance_matrix):
         "emd_no": emd_no((test_pred_tn, test_true), support_size=6)["emd"],
         "emd_with": emd_with((test_pred_tn, test_true), support_size=6)["emd"]
     }
-    
-    
-    slice_scores = {"Dirac": [], "TruncNormal": []}
-
+    slice_scores = {"TruncNormal": []}
     for (label, q), slice_df in test.groupby(["mode", "tercile"]):
         true_slice = np.stack(slice_df["score_list"].apply(lambda x: scores_to_distribution(x, n_classes=6)).values)
-
-        pred_slice_dirac = np.stack(slice_df["pred_scalar"].apply(dirac_head))
-        slice_scores["Dirac"].append({
-            "mode": label,
-            "tercile": q,
-            "jsd": jsd_calc((pred_slice_dirac, true_slice), support_size=6)["jsd"],
-            "emd_no": emd_no((pred_slice_dirac, true_slice), support_size=6)["emd"],
-            "emd_with": emd_with((pred_slice_dirac, true_slice), support_size=6)["emd"],
-        })
-
         pred_slice_tn = np.stack(slice_df.apply(
             lambda row: trunc_normal_head(row["pred_scalar"], best_sigma_by_strata[(label, q)]),
             axis=1,
@@ -393,11 +366,8 @@ def run_baseline_experiment(pretrained_ce, train, val, test, distance_matrix):
     
     # Print results summary
     print("\n=== BASELINE RESULTS ===")
-    print("JSD (Dirac):", global_scores["Dirac"]["jsd"])
     print("JSD (TruncNormal):", global_scores["TruncNormal"]["jsd"])
-    print("EMD (Dirac):", global_scores["Dirac"]["emd_with"])
     print("EMD (TruncNormal):", global_scores["TruncNormal"]["emd_with"])
-    print("EMD_no (Dirac):", global_scores["Dirac"]["emd_no"])
     print("EMD_no (TruncNormal):", global_scores["TruncNormal"]["emd_no"])
     
 
@@ -693,7 +663,7 @@ def main(base_dir):
 
     # ──── Multi-seed evaluation accumulators ────
     # ndcg_soft_runs, ndcg_hard_runs = [], []
-    hard_dirac_runs, hard_tn_runs = [], []
+    hard_tn_runs = []
     soft_calib_runs = []
     soft_calib_slice_last = []
     trained_global_runs = []      # soft global JSD/EMD
@@ -702,10 +672,6 @@ def main(base_dir):
                                                            "emd_with":0.0,
                                                            "n":0})
     # ---- HARD per-slice accumulators
-    hard_dirac_slice_dict = collections.defaultdict(lambda: {"jsd": 0.0,
-                                                             "emd_no": 0.0,
-                                                             "emd_with": 0.0,
-                                                             "n": 0})
     hard_tn_slice_dict = collections.defaultdict(lambda: {"jsd": 0.0,
                                                           "emd_no": 0.0,
                                                           "emd_with": 0.0,
@@ -884,14 +850,6 @@ def main(base_dir):
         emd_no   = EMD(convert_logits=False)
         emd_with = EMD(distance_matrix=distance_matrix, convert_logits=False)
 
-        # Dirac metrics
-        y_pred_dirac = np.stack(test_df[f"hard_pred_scalar_seed{seed}"].apply(dirac_head))
-        hard_dirac_runs.append({
-            "jsd": jsd_calc((y_pred_dirac, test_true),6)["jsd"],
-            "emd_no": emd_no((y_pred_dirac, test_true),6)["emd"],
-            "emd_with": emd_with((y_pred_dirac, test_true),6)["emd"]
-        })
-
         # TruncNormal metrics (heteroscedastic)
         y_pred_tn = np.stack(test_df.apply(
             lambda row: trunc_normal_head(row[f"hard_pred_scalar_seed{seed}"],
@@ -905,21 +863,9 @@ def main(base_dir):
         })
 
         # --- per‑slice evaluation for the HARD model ---
-        hard_dirac_slice_run = []
         hard_tn_slice_run = []
         for (lbl, q), g in test_df.groupby(["mode", "tercile"]):
             true_slice = np.stack(g["score_list"].apply(lambda x: scores_to_distribution(x, 6)))
-
-            # Dirac head
-            pred_dirac_slice = np.stack(g[f"hard_pred_scalar_seed{seed}"].apply(dirac_head))
-            dirac_metrics = {
-                "mode": lbl,
-                "tercile": q,
-                "jsd": jsd_calc((pred_dirac_slice, true_slice), 6)["jsd"],
-                "emd_no": emd_no((pred_dirac_slice, true_slice), 6)["emd"],
-                "emd_with": emd_with((pred_dirac_slice, true_slice), 6)["emd"]
-            }
-            hard_dirac_slice_run.append(dirac_metrics)
 
             # TruncNormal head
             pred_tn_slice = np.stack(g.apply(
@@ -936,7 +882,6 @@ def main(base_dir):
             }
             hard_tn_slice_run.append(tn_metrics)
 
-        accumulate_slice_metrics(hard_dirac_slice_dict, hard_dirac_slice_run)
         accumulate_slice_metrics(hard_tn_slice_dict, hard_tn_slice_run)
 
 
@@ -945,7 +890,6 @@ def main(base_dir):
     # ndcg_soft_stdev = pd.concat(ndcg_soft_runs, axis=1).std(axis=1)
     # ndcg_hard = pd.concat(ndcg_hard_runs, axis=1).mean(axis=1)
     # ndcg_hard_stdev = pd.concat(ndcg_hard_runs, axis=1).std(axis=1)
-    hard_dirac_avg = pd.DataFrame(hard_dirac_runs).mean().to_dict()
     hard_tn_avg    = pd.DataFrame(hard_tn_runs).mean().to_dict()
     soft_calib_avg = pd.DataFrame(soft_calib_runs).mean().to_dict()
 
@@ -954,7 +898,6 @@ def main(base_dir):
 
     # ---- aggregate per-slice
     soft_slice_avg = average_slice_metrics(trained_slice_dict)
-    hard_dirac_slice_avg = average_slice_metrics(hard_dirac_slice_dict)
     hard_tn_slice_avg = average_slice_metrics(hard_tn_slice_dict)
 
     
@@ -963,7 +906,6 @@ def main(base_dir):
     os.makedirs(calib_dir, exist_ok=True)
     
     # Optionally save to CSV alongside other results
-    pd.DataFrame(hard_dirac_slice_avg).to_csv(os.path.join(calib_dir, "hard_dirac_slice_avg.csv"), index=False)
     pd.DataFrame(hard_tn_slice_avg).to_csv(os.path.join(calib_dir, "hard_truncnormal_slice_avg.csv"), index=False)
 
     # ---- aggregate STSB / STS15 correlations
@@ -1053,25 +995,17 @@ def main(base_dir):
     print("EMD (Soft‑Calibrated):", soft_calib_avg["emd_with"])
     print("EMD_no (Soft):", soft_global_avg["emd_no"])
     print("EMD_no (Soft‑Calibrated):", soft_calib_avg["emd_no"])
-    print("JSD (Hard Dirac):", hard_dirac_avg["jsd"])
     print("JSD (Hard TruncNormal):", hard_tn_avg["jsd"])
-    print("EMD (Hard Dirac):", hard_dirac_avg["emd_with"])
     print("EMD (Hard TruncNormal):", hard_tn_avg["emd_with"])
-    print("EMD_no (Hard Dirac):", hard_dirac_avg["emd_no"])
     print("EMD_no (Hard TruncNormal):", hard_tn_avg["emd_no"])
-    print("JSD (Baseline Dirac):", baseline_results_all["Dirac"]["jsd"])
     print("JSD (Baseline TruncNormal):", baseline_results_all["TruncNormal"]["jsd"])
-    print("EMD (Baseline Dirac):", baseline_results_all["Dirac"]["emd_with"])
     print("EMD (Baseline TruncNormal):", baseline_results_all["TruncNormal"]["emd_with"])
-    print("EMD_no (Baseline Dirac):", baseline_results_all["Dirac"]["emd_no"])
     print("EMD_no (Baseline TruncNormal):", baseline_results_all["TruncNormal"]["emd_no"])
 
 
-    create_metrics_summary(baseline_results_slice["Dirac"], "Dirac")
     create_metrics_summary(baseline_results_slice["TruncNormal"], "TruncNormal")
     create_metrics_summary(soft_slice_avg, "trained_model_avg")
     create_metrics_summary(soft_calib_slice_last, "Soft-Calibrated")
-    create_metrics_summary(hard_dirac_slice_avg, "Hard-Calibrated Dirac")
     create_metrics_summary(hard_tn_slice_avg, "Hard-Calibrated TruncNormal")
     
     
@@ -1205,27 +1139,20 @@ def main(base_dir):
     # Combine all results into a single DataFrame and save to one file
     combined_results = {
         "trained_model": model_results_all["trained_model"],
-        "baseline_dirac": baseline_results_all["Dirac"],
         "baseline_truncnormal": baseline_results_all["TruncNormal"],
-        "hard_dirac_avg": hard_dirac_avg,
-        "hard_truncnormal_avg": hard_tn_avg
+        "hard_truncnormal_avg": hard_tn_avg,
     }
     combined_df = pd.DataFrame(combined_results)
     combined_df.to_csv(os.path.join(calib_dir, "all_results.csv"), index=True)
 
     # Save trained model slice results
     pd.DataFrame(model_results_slice["trained_model"]).to_csv(os.path.join(calib_dir, "trained_model_slices.csv"), index=False)
-    # Save baseline Dirac slice results
-    pd.DataFrame(baseline_results_slice["Dirac"]).to_csv(os.path.join(calib_dir, "baseline_dirac_slices.csv"), index=False)
     # Save baseline TruncNormal slice results
     pd.DataFrame(baseline_results_slice["TruncNormal"]).to_csv(os.path.join(calib_dir, "baseline_truncnormal_slices.csv"), index=False)
     # Save hard model slice results
-    pd.DataFrame(hard_dirac_runs).to_csv(os.path.join(calib_dir, "hard_dirac_slices.csv"), index=False)
     pd.DataFrame(hard_tn_runs).to_csv(os.path.join(calib_dir, "hard_truncnormal_slices.csv"), index=False)
     
     # Save average results for hard model
-    df_hard_dirac_avg = pd.DataFrame([hard_dirac_avg])
-    df_hard_dirac_avg.to_csv(os.path.join(calib_dir, "hard_dirac_avg.csv"), index=True)
     df_hard_tn_avg = pd.DataFrame([hard_tn_avg])
     df_hard_tn_avg.to_csv(os.path.join(calib_dir, "hard_truncnormal_avg.csv"), index=True)
     # Save average results for soft
@@ -1252,7 +1179,7 @@ def main(base_dir):
             
             # Find matching row in comparison results
             if use_slice_avg:
-                # For slice averages (hard_dirac_slice_avg, etc.)
+                # For slice averages (pre-aggregated results)
                 matching_row = next((r for r in comparison_results 
                                     if r["mode"] == mode and r["tercile"] == tercile), None)
                 if not matching_row:
@@ -1307,19 +1234,6 @@ def main(base_dir):
         model_results_slice["trained_model"], 
         baseline_results_slice["TruncNormal"], 
         "Baseline (TruncNormal)"
-    )
-
-    compute_model_differences(
-        model_results_slice["trained_model"], 
-        baseline_results_slice["Dirac"], 
-        "Baseline (Dirac)"
-    )
-
-    compute_model_differences(
-        model_results_slice["trained_model"], 
-        hard_dirac_slice_avg, 
-        "Hard Model (Dirac)", 
-        use_slice_avg=True
     )
 
     compute_model_differences(
